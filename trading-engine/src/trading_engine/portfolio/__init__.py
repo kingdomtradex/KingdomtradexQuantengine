@@ -1,4 +1,4 @@
-"""Portfolio construction and sizing."""
+"""Portfolio construction module."""
 
 from .constructor import PortfolioConstructor
 

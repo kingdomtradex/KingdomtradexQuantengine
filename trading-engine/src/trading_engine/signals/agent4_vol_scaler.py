@@ -1,126 +1,212 @@
 """
-Agent 4: Volatility Risk-Premium Scaler.
+Agent 4: Volatility Risk Premium Scaler.
 
-Computes differential between implied and realized volatility.
-Acts as multiplicative exposure scaler on aggregate output of Agents 1-3.
+Multiplicative exposure scaler based on the variance risk premium (VRP).
 
-When IV > RV (positive VRP): scales exposure toward 10.0x ceiling
-When RV > IV (premium inversion): forces rapid de-leveraging
+This agent enables the aggressive leverage regime by scaling gross exposure
+toward the 10.0x ceiling when IV > RV (positive variance risk premium) and
+forcing de-leveraging when RV > IV (premium inversion).
+
+Reference:
+Carr, P., & Wu, L. (2009). Variance Risk Premiums. Review of Financial Studies.
 """
 
-import logging
+from typing import Dict, Any, Optional
 import numpy as np
-from typing import Dict, Any
 
-logger = logging.getLogger(__name__)
+from ..config import Config
 
 
-class VolatilityScalerAgent:
+class VolatilityRiskScaler:
     """
-    Volatility risk-premium harvesting module.
+    Volatility risk premium exposure scaler.
     
-    Target leverage: L* = min(L_max, L_base * [1 + alpha * (VRP / sigma_VRP)])
+    Computes VRP = IV^2 - RV^2 and scales leverage accordingly:
+    - Positive VRP (IV > RV): Scale toward max leverage
+    - Negative VRP (RV > IV): De-lever to base
+    
+    This is NOT an independent directional signal but a multiplicative
+    scaler on the aggregate output of Agents 1-3.
     """
     
-    def __init__(self, config):
+    def __init__(self, config: Config):
+        """
+        Initialize volatility risk scaler.
+        
+        Args:
+            config: Configuration object with leverage parameters
+        """
         self.config = config
-        self.leverage_multiplier = 1.0
-        self.iv_history = []  # Implied volatility history
-        self.rv_history = []  # Realized volatility history
-        logger.info("Volatility scaler agent initialized")
-    
+        
+        # Leverage parameters
+        self.max_leverage = config.leverage.max_leverage
+        self.base_leverage = config.leverage.base_leverage
+        self.vrp_sensitivity = config.leverage.vrp_sensitivity
+        
+        # VRP tracking
+        self._iv_history: list = []
+        self._rv_history: list = []
+        self._vrp_history: list = []
+        
+        # Volatility estimation windows
+        self.rv_window = 20  # Days for realized vol
+        self.iv_source = "VIX"  # Implied vol source
+        
     def generate_signal(
-        self, 
-        market_data: Dict[str, Any], 
-        features: Dict[str, Any],
-        regime_state: int
-    ) -> Dict[str, Any]:
-        """
-        Compute leverage multiplier based on variance risk premium.
-        
-        This agent does NOT generate independent positions.
-        It returns a leverage multiplier for the ensemble.
-        """
-        # Aggregate volatility metrics across universe
-        avg_rv = np.mean([f.get('parkinson_vol', 0.02) for f in features.values()])
-        
-        # Simulated IV (in production: from VIX, options surfaces)
-        avg_iv = self._estimate_implied_vol(avg_rv)
-        
-        # Store for VRP estimation
-        self.rv_history.append(avg_rv)
-        self.iv_history.append(avg_iv)
-        
-        # Keep rolling window
-        max_len = 252
-        if len(self.rv_history) > max_len:
-            self.rv_history.pop(0)
-            self.iv_history.pop(0)
-        
-        # Compute VRP
-        vrp = avg_iv**2 - avg_rv**2
-        
-        # Normalize by trailing VRP volatility
-        if len(self.vrp_history()) >= 20:
-            sigma_vrp = np.std(self.vrp_history())
-        else:
-            sigma_vrp = 0.01  # Default
-        
-        # Compute target leverage
-        leverage = self._compute_leverage(vrp, sigma_vrp, regime_state)
-        self.leverage_multiplier = leverage
-        
-        return {
-            'positions': {},  # No direct positions
-            'leverage_multiplier': leverage,
-            'vrp': vrp,
-            'implied_vol': avg_iv,
-            'realized_vol': avg_rv,
-            'pnl_estimate': 0.0,
-            'vol_estimate': 0.0,
-        }
-    
-    def vrp_history(self) -> list:
-        """Get historical VRP values."""
-        return [iv**2 - rv**2 for iv, rv in zip(self.iv_history, self.rv_history)]
-    
-    def _estimate_implied_vol(self, realized_vol: float) -> float:
-        """Estimate implied volatility (simplified)."""
-        # In production: from VIX, SPX options, crypto perp funding rates
-        # Typical VRP is positive (IV > RV) in calm markets
-        base_iv = realized_vol + 0.005  # Small positive VRP baseline
-        return max(base_iv, 0.01)
-    
-    def _compute_leverage(
-        self, 
-        vrp: float, 
-        sigma_vrp: float,
-        regime_state: int
+        self,
+        instrument_id: str,
+        state: Any
     ) -> float:
         """
-        Compute leverage multiplier from VRP.
+        Generate VRP-based leverage multiplier signal.
         
-        Formula: L* = min(L_max, L_base * [1 + alpha * (VRP / sigma_VRP)])
+        Args:
+            instrument_id: Instrument identifier
+            state: Current market state
+            
+        Returns:
+            Leverage multiplier (0.0 to max_leverage)
         """
-        L_max = self.config.leverage.max_gross  # 10.0
-        L_base = self.config.leverage.base      # 1.0
-        alpha = self.config.leverage.variance_premium_sensitivity  # 0.5
+        vrp = self.compute_vrp()
         
-        # Regime gate (hard constraint)
-        regime_gate = [1.0, 0.5, 0.0][regime_state] if regime_state < 3 else 0.0
+        if vrp is None:
+            return self.base_leverage
+            
+        # Calculate target leverage using VRP scaling formula
+        # L_t* = min(L_max, L_base * [1 + alpha * (VRP / sigma_VRP)])
+        vrp_std = np.std(self._vrp_history[-100:]) if len(self._vrp_history) >= 100 else 1.0
         
-        if sigma_vrp <= 0 or regime_gate == 0:
-            return L_base * regime_gate
+        if vrp_std < 1e-9:
+            vrp_std = 1.0
+            
+        normalized_vrp = vrp / vrp_std
+        target_leverage = self.base_leverage * (1 + self.vrp_sensitivity * normalized_vrp)
+        target_leverage = min(self.max_leverage, max(1.0, target_leverage))
         
-        # Scaled leverage
-        scaled = L_base * (1 + alpha * (vrp / sigma_vrp))
+        return target_leverage
+    
+    def compute_vrp(self) -> Optional[float]:
+        """
+        Compute variance risk premium.
         
-        # Apply bounds
-        leverage = max(L_base, min(L_max, scaled))
+        VRP_t = IV_t^2 - RV_t^2
         
-        # Apply regime gate
-        leverage *= regime_gate
+        Returns:
+            Variance risk premium, or None if insufficient data
+        """
+        iv = self._get_implied_volatility()
+        rv = self._get_realized_volatility()
         
-        logger.debug(f"Leverage multiplier: {leverage:.2f} (VRP={vrp:.6f})")
+        if iv is None or rv is None:
+            return None
+            
+        self._iv_history.append(iv)
+        self._rv_history.append(rv)
         
-        return leverage
+        vrp = (iv ** 2) - (rv ** 2)
+        self._vrp_history.append(vrp)
+        
+        return vrp
+    
+    def _get_implied_volatility(self) -> Optional[float]:
+        """
+        Get current implied volatility.
+        
+        In production, this reads from CBOE VIX and listed options surfaces.
+        
+        Returns:
+            Implied volatility (annualized), or None if unavailable
+        """
+        # Placeholder: simulate IV based on market state
+        # In production: fetch from options data feed
+        
+        # Simple simulation based on average volatility feature
+        if hasattr(self, '_last_state') and hasattr(self._last_state, 'features'):
+            features = list(self._last_state.features.values())
+            if features:
+                avg_vol = np.mean([f[5] for f in features])
+                return avg_vol * 252 ** 0.5  # Annualize
+                
+        return 0.20  # Default 20% annualized IV
+    
+    def _get_realized_volatility(self) -> Optional[float]:
+        """
+        Get current realized volatility.
+        
+        Uses Parkinson estimator and EWMA for robustness.
+        
+        Returns:
+            Realized volatility (annualized), or None if unavailable
+        """
+        # Placeholder: simulate RV
+        # In production: compute from actual price history
+        
+        if len(self._rv_history) > 0:
+            return self._rv_history[-1]
+            
+        return 0.15  # Default 15% annualized RV
+    
+    def get_leverage_multiplier(self) -> float:
+        """
+        Get current leverage multiplier.
+        
+        Returns:
+            Multiplier relative to base leverage (1.0 to L_max/L_base)
+        """
+        vrp = self.compute_vrp()
+        
+        if vrp is None:
+            return 1.0
+            
+        vrp_std = np.std(self._vrp_history[-100:]) if len(self._vrp_history) >= 100 else 1.0
+        if vrp_std < 1e-9:
+            vrp_std = 1.0
+            
+        normalized_vrp = vrp / vrp_std
+        multiplier = 1 + self.vrp_sensitivity * normalized_vrp
+        
+        max_multiplier = self.max_leverage / self.base_leverage
+        return min(max_multiplier, max(1.0, multiplier))
+    
+    def is_vrp_favorable(self, threshold: float = 0.0) -> bool:
+        """
+        Check if VRP is favorable for leverage scaling.
+        
+        Args:
+            threshold: Minimum VRP threshold
+            
+        Returns:
+            True if VRP > threshold (favorable for leverage)
+        """
+        vrp = self.compute_vrp()
+        
+        if vrp is None:
+            return False
+            
+        return vrp > threshold
+    
+    def force_deleverage(self) -> float:
+        """
+        Force immediate de-leveraging to base leverage.
+        
+        Called during fractured regimes or circuit breaker events.
+        
+        Returns:
+            Base leverage level
+        """
+        return self.base_leverage
+    
+    def get_vrp_percentile(self) -> float:
+        """
+        Get current VRP percentile in historical distribution.
+        
+        Returns:
+            Percentile rank (0.0 to 1.0)
+        """
+        if len(self._vrp_history) < 20:
+            return 0.5
+            
+        current_vrp = self._vrp_history[-1]
+        percentile = np.mean([1.0 if v < current_vrp else 0.0 for v in self._vrp_history[:-1]])
+        
+        return float(percentile)

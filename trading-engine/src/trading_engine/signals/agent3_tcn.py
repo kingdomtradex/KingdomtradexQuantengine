@@ -1,89 +1,201 @@
 """
-Agent 3: TCN Forecaster Agent.
+Agent 3: TCN Forecaster.
 
 Temporal Convolutional Network for 10-second forward price forecasting.
-Model weights are proprietary and loaded from secure storage.
+
+Note: Model weights are proprietary and not included in this open-source release.
+The architecture definition is provided for transparency, but load_weights()
+must be implemented with secure weight loading in production.
+
+Reference:
+Bai, S., et al. (2018). An Empirical Evaluation of Generic Convolutional and
+Recurrent Networks for Sequence Modeling.
 """
 
-import logging
-import numpy as np
 from typing import Dict, Any, Optional
+import numpy as np
 
-logger = logging.getLogger(__name__)
+from ..config import Config
 
 
-class TCNForecasterAgent:
+class TCNForecaster:
     """
-    TCN-based short-term price forecaster.
+    Temporal Convolutional Network price forecaster.
     
-    Predicts 10-second forward returns using microstructure features.
-    Model architecture is public; weights are proprietary.
+    Predicts 10-second forward returns using dilated causal convolutions
+    over microstructure features.
+    
+    Architecture (proprietary weights):
+    - Input: 6-dimensional feature vector history (200 timesteps)
+    - 4 residual blocks with dilation rates [1, 2, 4, 8]
+    - Output: Scalar return prediction
     """
     
-    def __init__(self, config):
+    def __init__(self, config: Config):
+        """
+        Initialize TCN forecaster.
+        
+        Args:
+            config: Configuration object
+        """
         self.config = config
-        self._model_loaded = False
-        self._model_weights = None  # Proprietary - not included
-        logger.info("TCN forecaster agent initialized (weights not loaded)")
-    
+        
+        # Architecture parameters
+        self.input_dim = 6  # OFI, quote_slope, spread_persist, bid_depth, ask_depth, vol
+        self.history_length = 200
+        self.num_blocks = 4
+        self.dilation_rates = [1, 2, 4, 8]
+        
+        # Feature history buffer
+        self._feature_history: Dict[str, list] = {}
+        
+        # Weights status
+        self._weights_loaded = False
+        
     def generate_signal(
-        self, 
-        market_data: Dict[str, Any], 
-        features: Dict[str, Any],
-        regime_state: int
-    ) -> Dict[str, Any]:
-        """Generate directional signals from TCN forecasts."""
-        positions = {}
+        self,
+        instrument_id: str,
+        state: Any
+    ) -> float:
+        """
+        Generate TCN forecast signal.
         
-        # TCN performs poorly in fractured regimes
-        if regime_state == 2:
-            return {'positions': {}, 'pnl_estimate': 0.0, 'vol_estimate': 0.0}
+        Args:
+            instrument_id: Instrument identifier
+            state: Current market state
+            
+        Returns:
+            Predicted 10-second return (-1 to 1 scale)
+        """
+        if not self._weights_loaded:
+            # Without weights, return neutral signal
+            return 0.0
+            
+        if instrument_id not in state.features:
+            return 0.0
+            
+        # Update feature history
+        current_features = state.features[instrument_id]
         
-        for symbol, feat in features.items():
-            if symbol not in market_data:
-                continue
+        if instrument_id not in self._feature_history:
+            self._feature_history[instrument_id] = []
             
-            # Construct feature vector for TCN
-            # In production: [OFI, quote_slope, spread_persistence, parkinson_vol, ...]
-            feature_vec = np.array([
-                feat.get('ofi', 0.0),
-                feat.get('quote_slope', 0.0),
-                feat.get('spread_persistence', 0.5),
-                feat.get('parkinson_vol', 0.02),
-            ])
-            
-            # Forward pass through TCN (simulated)
-            # Production: prediction = self._tcn_model.predict(feature_vec)
-            prediction = self._simulate_tcn_prediction(feature_vec, regime_state)
-            
-            # Convert prediction to position
-            if abs(prediction) > 0.0005:  # 5 bps threshold
-                positions[symbol] = np.sign(prediction) * min(abs(prediction) * 100, 2.0)
+        self._feature_history[instrument_id].append(current_features.copy())
         
-        return {
-            'positions': positions,
-            'pnl_estimate': 0.002 if regime_state == 0 else 0.001,
-            'vol_estimate': 0.03,
-        }
+        # Trim history
+        if len(self._feature_history[instrument_id]) > self.history_length:
+            self._feature_history[instrument_id].pop(0)
+            
+        # Need full history for prediction
+        if len(self._feature_history[instrument_id]) < self.history_length:
+            return 0.0
+            
+        # Prepare input tensor
+        X = np.array(self._feature_history[instrument_id])
+        X = X.reshape(1, self.history_length, self.input_dim)
+        
+        # Forward pass (placeholder - requires loaded weights)
+        prediction = self._forward(X)
+        
+        # Scale prediction to [-1, 1] range
+        return float(np.clip(prediction, -1.0, 1.0))
     
-    def _simulate_tcn_prediction(self, features: np.ndarray, regime: int) -> float:
-        """Simulate TCN prediction (placeholder for proprietary model)."""
-        # Simplified linear combination
-        weights = np.array([0.3, 0.2, -0.1, 0.4])
-        pred = np.dot(features, weights)
+    def _forward(self, X: np.ndarray) -> float:
+        """
+        Forward pass through TCN.
         
-        # Scale by regime confidence
-        regime_scale = [1.0, 0.7, 0.0][regime] if regime < 3 else 0.0
+        Args:
+            X: Input tensor [batch, time, features]
+            
+        Returns:
+            Return prediction
+        """
+        # Placeholder implementation
+        # In production, this loads proprietary weights and runs PyTorch model
         
-        return pred * regime_scale
+        # Simple mean-reversion baseline as fallback
+        recent_returns = np.diff(X[0, :, 5])  # Volatility feature changes
+        if len(recent_returns) > 0:
+            mean_return = np.mean(recent_returns[-50:])
+            return -mean_return * 10  # Mean-reversion signal
+        return 0.0
     
     def load_weights(self, path: str) -> None:
         """
-        Load proprietary TCN weights from secure storage.
+        Load proprietary model weights.
         
         Args:
-            path: Path to encrypted weights file
+            path: Path to weights file
+            
+        Note:
+            This method must be implemented with secure weight loading.
+            Weights are not included in the open-source release.
         """
-        # Not implemented - weights are proprietary
-        logger.warning("TCN weight loading not available in open-source version")
-        self._model_loaded = False
+        # Placeholder for weight loading
+        # In production:
+        #   import torch
+        #   self.model.load_state_dict(torch.load(path))
+        #   self._weights_loaded = True
+        
+        raise NotImplementedError(
+            "Model weights are proprietary. Implement secure weight loading "
+            "in production environment."
+        )
+    
+    def get_architecture_summary(self) -> dict:
+        """
+        Get model architecture summary.
+        
+        Returns:
+            Dictionary describing model architecture
+        """
+        return {
+            "input_dim": self.input_dim,
+            "history_length": self.history_length,
+            "num_residual_blocks": self.num_blocks,
+            "dilation_rates": self.dilation_rates,
+            "output_dim": 1,
+            "activation": "ReLU",
+            "normalization": "WeightNorm",
+            "dropout": 0.0,
+            "weights_status": "proprietary"
+        }
+    
+    def train_step(
+        self,
+        X_batch: np.ndarray,
+        y_batch: np.ndarray
+    ) -> float:
+        """
+        Perform training step.
+        
+        Args:
+            X_batch: Input batch [batch_size, time, features]
+            y_batch: Target returns [batch_size]
+            
+        Returns:
+            Loss value
+        """
+        # Placeholder for training logic
+        # In production, uses PyTorch with async batch pipeline
+        return 0.0
+    
+    def validate(
+        self,
+        X_val: np.ndarray,
+        y_val: np.ndarray
+    ) -> tuple:
+        """
+        Validate model on holdout set.
+        
+        Args:
+            X_val: Validation inputs
+            y_val: Validation targets
+            
+        Returns:
+            Tuple of (validation_loss, within_tolerance)
+        """
+        val_loss = 0.0  # Placeholder
+        tolerance = self.config.training.validation_loss_tolerance
+        
+        return (val_loss, val_loss <= tolerance)

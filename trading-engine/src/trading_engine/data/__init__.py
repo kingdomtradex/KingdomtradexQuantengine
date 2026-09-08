@@ -1,5 +1,5 @@
-"""Market data ingestion and normalization layer."""
+"""Data ingestion module."""
 
-from .market_data import MarketDataHandler, OrderBook, TickData
+from .market_data import MarketDataHandler
 
-__all__ = ["MarketDataHandler", "OrderBook", "TickData"]
+__all__ = ["MarketDataHandler"]

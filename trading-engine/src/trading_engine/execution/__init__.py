@@ -1,4 +1,4 @@
-"""Smart order routing and execution."""
+"""Execution engine module."""
 
 from .engine import ExecutionEngine
 

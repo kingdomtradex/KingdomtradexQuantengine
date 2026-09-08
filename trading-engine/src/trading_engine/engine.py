@@ -1,189 +1,216 @@
 """
-Main Trading Engine orchestrator.
+Main TradingEngine orchestrator.
 
-Coordinates all system components in the five-stage pipeline:
-Data Ingestion → Feature Engineering → Signal Generation → 
-Portfolio Construction → Order Execution
+Coordinates the five-stage pipeline:
+1. Data Ingestion
+2. Feature Engineering
+3. Signal Generation
+4. Portfolio Construction
+5. Order Execution
 """
 
-import logging
-from typing import Optional, Dict, Any
-from datetime import datetime
+from typing import Dict, Any, Optional, List
+import numpy as np
 
 from .config import Config
 from .data.market_data import MarketDataHandler
 from .features.regime import RegimeClassifier
-from .signals.ensemble import AgentEnsemble
+from .signals.ensemble import SignalEnsemble
 from .risk.manager import RiskManager
 from .portfolio.constructor import PortfolioConstructor
 from .execution.engine import ExecutionEngine
 
 
-logger = logging.getLogger(__name__)
+class MarketState:
+    """Container for current market state."""
+    
+    def __init__(
+        self,
+        order_books: Dict[str, Any],
+        features: Dict[str, np.ndarray],
+        regime_state: int,
+        regime_probs: np.ndarray,
+        variance_risk_premium: float,
+        current_pnl: float,
+        positions: Dict[str, float],
+        collateral_utilization: float
+    ):
+        self.order_books = order_books
+        self.features = features
+        self.regime_state = regime_state
+        self.regime_probs = regime_probs
+        self.variance_risk_premium = variance_risk_premium
+        self.current_pnl = current_pnl
+        self.positions = positions
+        self.collateral_utilization = collateral_utilization
 
 
 class TradingEngine:
     """
-    Main trading engine orchestrating the five-stage pipeline.
+    Main orchestrator for the statistical arbitrage trading system.
     
-    Attributes:
-        config: System configuration parameters
-        market_data: Market data ingestion and normalization
-        regime_classifier: HMM-based regime classification
-        signal_ensemble: 4-agent signal generation ensemble
-        risk_manager: Risk management and circuit breakers
-        portfolio_constructor: Portfolio construction and sizing
-        execution_engine: Smart order routing and execution
+    Implements the five-stage pipeline with hard risk constraints
+    and dynamic leverage scaling based on variance risk premium.
     """
     
-    def __init__(self, config: Optional[Config] = None):
+    def __init__(self, config: Config):
         """
         Initialize the trading engine.
         
         Args:
-            config: Configuration object. Uses defaults if None.
+            config: Configuration object with all parameters
         """
-        self.config = config or Config.default()
-        self._running = False
-        self._pnl_cumulative = 0.0
-        self._pnl_daily = 0.0
+        self.config = config
+        config.validate()
         
         # Initialize pipeline components
-        logger.info("Initializing market data handler...")
-        self.market_data = MarketDataHandler(self.config)
+        self.data_handler = MarketDataHandler(config)
+        self.regime_classifier = RegimeClassifier(config)
+        self.signal_ensemble = SignalEnsemble(config)
+        self.risk_manager = RiskManager(config)
+        self.portfolio_constructor = PortfolioConstructor(config)
+        self.execution_engine = ExecutionEngine(config)
         
-        logger.info("Initializing regime classifier...")
-        self.regime_classifier = RegimeClassifier(self.config)
+        # State tracking
+        self._current_pnl = 0.0
+        self._positions: Dict[str, float] = {}
+        self._is_observation_only = False
+        self._daily_start_pnl = 0.0
         
-        logger.info("Initializing signal ensemble...")
-        self.signal_ensemble = AgentEnsemble(self.config)
-        
-        logger.info("Initializing risk manager...")
-        self.risk_manager = RiskManager(self.config)
-        
-        logger.info("Initializing portfolio constructor...")
-        self.portfolio_constructor = PortfolioConstructor(
-            self.config, 
-            self.risk_manager
-        )
-        
-        logger.info("Initializing execution engine...")
-        self.execution_engine = ExecutionEngine(self.config)
-        
-        logger.info("Trading engine initialized successfully.")
-    
-    def run(self) -> None:
+    def get_market_state(self) -> MarketState:
         """
-        Start the main trading loop.
-        
-        This method blocks until stop() is called or a circuit breaker triggers.
-        """
-        logger.info("Starting trading engine...")
-        self._running = True
-        
-        try:
-            while self._running:
-                self._step()
-        except KeyboardInterrupt:
-            logger.info("Interrupted by user.")
-        finally:
-            self.stop()
-    
-    def _step(self) -> None:
-        """Execute one iteration of the trading pipeline."""
-        try:
-            # Stage 1: Data Ingestion
-            market_data = self.market_data.get_latest()
-            
-            # Stage 2: Feature Engineering & Regime Classification
-            features = self.market_data.compute_features(market_data)
-            regime_state = self.regime_classifier.classify(features)
-            
-            # Check regime gate - force de-leveraging in Fractured state
-            if regime_state == 2:  # Fractured/Illiquid
-                logger.warning("Fractured regime detected - forcing de-leveraging")
-                self.risk_manager.force_deleveraging()
-            
-            # Stage 3: Signal Generation
-            signals = self.signal_ensemble.generate_signals(
-                market_data, 
-                features, 
-                regime_state
-            )
-            
-            # Stage 4: Portfolio Construction (with risk constraints)
-            target_portfolio = self.portfolio_constructor.construct(
-                signals, 
-                regime_state,
-                self._pnl_daily
-            )
-            
-            # Stage 5: Order Execution
-            orders = self.execution_engine.generate_orders(target_portfolio)
-            fills = self.execution_engine.execute(orders)
-            
-            # Update P&L
-            self._update_pnl(fills)
-            
-            # Check circuit breaker
-            if self._pnl_daily <= self.config.risk.daily_drawdown_limit:
-                logger.critical(
-                    f"Circuit breaker triggered! Daily PnL: {self._pnl_daily:.4f}"
-                )
-                self.trigger_liquidation()
-                
-        except Exception as e:
-            logger.error(f"Error in trading loop: {e}", exc_info=True)
-    
-    def _update_pnl(self, fills: Dict[str, Any]) -> None:
-        """Update cumulative and daily P&L from fills."""
-        # Simplified P&L calculation
-        pnl_change = fills.get('realized_pnl', 0.0)
-        self._pnl_cumulative += pnl_change
-        self._pnl_daily += pnl_change
-    
-    def trigger_liquidation(self) -> None:
-        """
-        Trigger hard-stop circuit breaker.
-        
-        Immediately ceases order generation, liquidates positions
-        to delta-neutral, and enters Observation Only state.
-        """
-        logger.critical("TRIGGERING HARD-STOP CIRCUIT BREAKER")
-        
-        # Stop generating new orders
-        self._running = False
-        
-        # Liquidate all positions to delta-neutral
-        self.execution_engine.liquidate_all()
-        
-        # Enter observation-only state
-        self.risk_manager.set_observation_mode(True)
-        
-        logger.info("System entered Observation Only state until next settlement.")
-    
-    def stop(self) -> None:
-        """Gracefully stop the trading engine."""
-        logger.info("Stopping trading engine...")
-        self._running = False
-        self.execution_engine.close()
-        logger.info("Trading engine stopped.")
-    
-    def get_status(self) -> Dict[str, Any]:
-        """
-        Get current engine status.
+        Retrieve current market state from data layer.
         
         Returns:
-            Dictionary containing operational status, P&L, and risk metrics.
+            MarketState object with current market data
         """
-        return {
-            "running": self._running,
-            "pnl_cumulative": self._pnl_cumulative,
-            "pnl_daily": self._pnl_daily,
-            "regime_state": self.regime_classifier.current_state,
-            "gross_exposure": self.risk_manager.get_gross_exposure(),
-            "net_exposure": self.risk_manager.get_net_exposure(),
-            "leverage": self.risk_manager.get_current_leverage(),
-            "observation_mode": self.risk_manager.is_observation_mode(),
-            "timestamp": datetime.utcnow().isoformat()
-        }
+        order_books = self.data_handler.get_order_books()
+        features = self.data_handler.compute_features()
+        
+        regime_state, regime_probs = self.regime_classifier.classify(features)
+        vrp = self.signal_ensemble.agent4.compute_vrp()
+        
+        return MarketState(
+            order_books=order_books,
+            features=features,
+            regime_state=regime_state,
+            regime_probs=regime_probs,
+            variance_risk_premium=vrp,
+            current_pnl=self._current_pnl,
+            positions=self._positions,
+            collateral_utilization=self.risk_manager.get_collateral_utilization()
+        )
+    
+    def generate_signals(self, state: MarketState) -> Dict[str, np.ndarray]:
+        """
+        Generate trading signals from the four-agent ensemble.
+        
+        Args:
+            state: Current market state
+            
+        Returns:
+            Dictionary mapping instrument IDs to signal values
+        """
+        if self._is_observation_only:
+            return {inst: np.zeros(4) for inst in state.order_books.keys()}
+        
+        signals = self.signal_ensemble.generate(state)
+        return signals
+    
+    def construct_portfolio(
+        self,
+        signals: Dict[str, np.ndarray],
+        state: MarketState
+    ) -> Dict[str, float]:
+        """
+        Construct portfolio from signals with risk constraints.
+        
+        Args:
+            signals: Agent signals per instrument
+            state: Current market state
+            
+        Returns:
+            Dictionary mapping instrument IDs to target positions
+        """
+        if self._is_observation_only:
+            return {}
+        
+        target_positions = self.portfolio_constructor.construct(
+            signals=signals,
+            state=state,
+            current_positions=self._positions
+        )
+        
+        return target_positions
+    
+    def route_orders(
+        self,
+        portfolio: Dict[str, float],
+        state: MarketState
+    ) -> List[Dict[str, Any]]:
+        """
+        Route orders to venues via smart order router.
+        
+        Args:
+            portfolio: Target positions
+            state: Current market state
+            
+        Returns:
+            List of order dictionaries
+        """
+        if self._is_observation_only:
+            return []
+        
+        orders = self.execution_engine.route(portfolio, state)
+        return orders
+    
+    def execute_cycle(self) -> Optional[List[Dict[str, Any]]]:
+        """
+        Execute one full pipeline cycle.
+        
+        Returns:
+            List of orders to execute, or None if circuit breaker triggered
+        """
+        state = self.get_market_state()
+        
+        if self.risk_manager.check_circuit_breaker(state.current_pnl):
+            self._trigger_circuit_breaker()
+            return None
+        
+        signals = self.generate_signals(state)
+        portfolio = self.construct_portfolio(signals, state)
+        orders = self.route_orders(portfolio, state)
+        
+        return orders
+    
+    def _trigger_circuit_breaker(self) -> None:
+        """
+        Activate circuit breaker protocol.
+        
+        Immediately ceases order generation and liquidates to delta-neutral.
+        """
+        self._is_observation_only = True
+        self.risk_manager.liquidate_all()
+        print(f"CIRCUIT BREAKER TRIGGERED at PnL={self._current_pnl:.4f}")
+    
+    def update_pnl(self, pnl_change: float) -> None:
+        """
+        Update cumulative PnL.
+        
+        Args:
+            pnl_change: PnL change from executed trades
+        """
+        self._current_pnl += pnl_change
+        
+        if self._current_pnl < self._daily_start_pnl + self.config.risk.max_daily_drawdown:
+            self._trigger_circuit_breaker()
+    
+    def reset_daily(self) -> None:
+        """Reset daily state for new trading session."""
+        self._daily_start_pnl = self._current_pnl
+        self._is_observation_only = False
+    
+    def liquidate_all(self) -> None:
+        """Force liquidation of all positions."""
+        self.risk_manager.liquidate_all()
+        self._positions = {}

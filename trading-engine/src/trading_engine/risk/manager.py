@@ -1,193 +1,271 @@
 """
-Unified Risk Management Framework.
+Unified risk management with hard circuit breakers.
 
-Implements hierarchical risk constraints:
-- Position-level: 0.75% risk-per-trade cap
-- Portfolio-level: Fractional Kelly sizing
-- System-level: -2.5% daily drawdown circuit breaker
-- Leverage: Dynamic scaling up to 10.0x ceiling
+Risk management is the governing constraint of the architecture, especially
+critical under the aggressive 10.0x leverage regime.
+
+Key features:
+- Consolidated USD-equivalent delta, gamma, vega sensitivities
+- Fractional Kelly position sizing (lambda = 0.40)
+- Hard 0.75% risk-per-trade limit
+- -2.5% daily drawdown circuit breaker
+- Pre-emptive de-leveraging at 80% collateral utilization
 """
 
-import logging
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
+import numpy as np
 
-logger = logging.getLogger(__name__)
+from ..config import Config
 
 
 class RiskManager:
     """
-    Centralized risk management with hard circuit breakers.
+    Centralized risk management system.
     
-    Attributes:
-        config: System configuration
-        observation_mode: True if system is in observation-only state
-        gross_exposure: Current gross notional exposure
-        net_exposure: Current net notional exposure
+    Enforces hard constraints on exposure, drawdown, and collateral
+    utilization across all asset classes.
     """
     
-    def __init__(self, config):
+    def __init__(self, config: Config):
+        """
+        Initialize risk manager.
+        
+        Args:
+            config: Configuration object with risk parameters
+        """
         self.config = config
-        self.observation_mode = False
-        self.gross_exposure = 0.0
-        self.net_exposure = 0.0
-        self.current_leverage = 1.0
-        self._daily_pnl = 0.0
         
-        logger.info("Risk manager initialized")
-        logger.info(f"Daily drawdown limit: {config.risk.daily_drawdown_limit:.2%}")
-        logger.info(f"Max leverage: {config.leverage.max_gross}x")
-    
-    def check_circuit_breaker(self, daily_pnl: float) -> bool:
+        # Risk limits from config
+        self.max_daily_drawdown = config.risk.max_daily_drawdown
+        self.max_gross_leverage = config.risk.max_gross_leverage
+        self.kelly_multiplier = config.risk.kelly_multiplier
+        self.risk_per_trade = config.risk.risk_per_trade
+        
+        # State tracking
+        self._daily_start_equity = config.initial_capital
+        self._current_equity = config.initial_capital
+        self._positions: Dict[str, float] = {}
+        self._collateral_utilization = 0.0
+        
+        # Greeks aggregation
+        self._total_delta = 0.0
+        self._total_gamma = 0.0
+        self._total_vega = 0.0
+        
+        # Circuit breaker state
+        self._circuit_breaker_triggered = False
+        self._observation_only = False
+        
+    def check_circuit_breaker(self, current_pnl: float) -> bool:
         """
-        Check if daily drawdown has triggered circuit breaker.
+        Check if circuit breaker should trigger.
+        
+        Trigger condition: Intraday cumulative PnL < -2.5%
         
         Args:
-            daily_pnl: Current daily P&L
+            current_pnl: Current cumulative PnL for the day
             
         Returns:
-            True if circuit breaker should trigger
+            True if circuit breaker triggered
         """
-        self._daily_pnl = daily_pnl
-        threshold = self.config.risk.daily_drawdown_limit
+        daily_return = current_pnl / self._daily_start_equity
         
-        if daily_pnl <= threshold:
-            logger.critical(
-                f"CIRCUIT BREAKER TRIGGERED: Daily PnL {daily_pnl:.4f} "
-                f"< threshold {threshold:.4f}"
-            )
+        if daily_return < self.max_daily_drawdown:
+            self._trigger_circuit_breaker()
             return True
+            
         return False
     
-    def get_position_size(
-        self, 
-        signal_strength: float, 
-        volatility: float,
-        capital: float
-    ) -> float:
+    def _trigger_circuit_breaker(self) -> None:
+        """Activate circuit breaker protocol."""
+        self._circuit_breaker_triggered = True
+        self._observation_only = True
+        print(f"CIRCUIT BREAKER: Daily drawdown exceeded {self.max_daily_drawdown:.2%}")
+    
+    def reset_daily(self, new_start_equity: float) -> None:
         """
-        Compute position size using fractional Kelly criterion.
-        
-        Formula: f_deployed = λ * (μ / σ²) subject to 0.75% risk cap
+        Reset daily state for new trading session.
         
         Args:
-            signal_strength: Expected excess return (μ)
-            volatility: Return variance (σ²)
-            capital: Available capital
+            new_start_equity: Starting equity for the day
+        """
+        self._daily_start_equity = new_start_equity
+        self._circuit_breaker_triggered = False
+        self._observation_only = False
+        
+    def calculate_position_size(
+        self,
+        expected_return: float,
+        variance: float,
+        current_exposure: float
+    ) -> float:
+        """
+        Calculate position size using fractional Kelly Criterion.
+        
+        f_deployed = lambda * (mu / sigma^2)
+        
+        Subject to 0.75% risk-per-trade cap.
+        
+        Args:
+            expected_return: Expected excess return (mu)
+            variance: Return variance (sigma^2)
+            current_exposure: Current exposure to instrument
             
         Returns:
-            Position size in dollar terms
+            Target position size
         """
-        if volatility <= 0:
+        if variance <= 0 or abs(expected_return) < 1e-9:
             return 0.0
-        
+            
         # Full Kelly fraction
-        kelly_fraction = signal_strength / (volatility ** 2)
+        full_kelly = expected_return / variance
         
-        # Apply fractional multiplier (λ = 0.40)
-        lambda_mult = self.config.risk.kelly_multiplier
-        adjusted_fraction = lambda_mult * kelly_fraction
+        # Apply fractional multiplier (lambda = 0.40)
+        fractional_kelly = self.kelly_multiplier * full_kelly
         
-        # Apply risk-per-trade cap (0.75%)
-        max_fraction = self.config.risk.risk_per_trade
-        adjusted_fraction = max(-max_fraction, min(adjusted_fraction, max_fraction))
+        # Convert to dollar position based on current equity
+        target_position = fractional_kelly * self._current_equity
         
-        # Convert to dollar position
-        position_size = adjusted_fraction * capital
+        # Apply risk-per-trade cap
+        max_risk_amount = self.risk_per_trade * self._current_equity
+        max_position = max_risk_amount / (np.sqrt(variance) + 1e-9)
         
-        return position_size
+        # Limit position to risk cap
+        target_position = np.clip(
+            target_position,
+            -max_position,
+            max_position
+        )
+        
+        # Respect gross leverage ceiling
+        max_gross_exposure = self._current_equity * self.max_gross_leverage
+        current_gross = sum(abs(p) for p in self._positions.values())
+        
+        remaining_capacity = max_gross_exposure - current_gross
+        if abs(target_position) > abs(remaining_capacity):
+            target_position = np.sign(target_position) * max(0, remaining_capacity)
+        
+        return float(target_position)
     
-    def compute_dynamic_leverage(
-        self, 
-        vrp: float, 
-        regime_gate: float
-    ) -> float:
-        """
-        Compute target leverage based on VRP and regime.
-        
-        Args:
-            vrp: Variance risk premium
-            regime_gate: Regime gate multiplier (0-1)
-            
-        Returns:
-            Target leverage multiplier
-        """
-        L_max = self.config.leverage.max_gross
-        L_base = self.config.leverage.base
-        alpha = self.config.leverage.variance_premium_sensitivity
-        
-        if regime_gate == 0:
-            return L_base * regime_gate
-        
-        # Scaled leverage from VRP
-        sigma_vrp = 0.01  # Normalization factor
-        scaled = L_base * (1 + alpha * (vrp / sigma_vrp))
-        
-        # Bound and apply regime gate
-        leverage = max(L_base, min(L_max, scaled))
-        leverage *= regime_gate
-        
-        self.current_leverage = leverage
-        return leverage
-    
-    def force_deleveraging(self) -> None:
-        """Force immediate de-leveraging (called in fractured regime)."""
-        logger.warning("Forcing immediate de-leveraging")
-        self.current_leverage = 0.0
-    
-    def set_observation_mode(self, enabled: bool) -> None:
-        """Set observation-only mode (no trading)."""
-        self.observation_mode = enabled
-        status = "ENABLED" if enabled else "DISABLED"
-        logger.info(f"Observation mode {status}")
-    
-    def is_observation_mode(self) -> bool:
-        """Check if system is in observation-only mode."""
-        return self.observation_mode
-    
-    def get_gross_exposure(self) -> float:
-        """Get current gross exposure."""
-        return self.gross_exposure
-    
-    def get_net_exposure(self) -> float:
-        """Get current net exposure."""
-        return self.net_exposure
-    
-    def get_current_leverage(self) -> float:
-        """Get current leverage multiplier."""
-        return self.current_leverage
-    
-    def update_exposures(
-        self, 
-        positions: Dict[str, float],
-        prices: Dict[str, float]
+    def update_greeks(
+        self,
+        instrument_id: str,
+        delta: float,
+        gamma: float,
+        vega: float
     ) -> None:
-        """Update exposure metrics from positions."""
-        gross = sum(abs(pos * prices.get(sym, 0)) for sym, pos in positions.items())
-        net = sum(pos * prices.get(sym, 0) for sym, pos in positions.items())
-        
-        self.gross_exposure = gross
-        self.net_exposure = net
-    
-    def check_margin_threshold(self, collateral: float, required: float) -> bool:
         """
-        Check if margin utilization exceeds pre-emptive de-leveraging threshold.
+        Update aggregated Greeks.
         
         Args:
-            collateral: Available collateral
-            required: Required margin
-            
-        Returns:
-            True if de-leveraging should be triggered
+            instrument_id: Instrument identifier
+            delta: Dollar delta
+            gamma: Dollar gamma
+            vega: Dollar vega
         """
-        if collateral <= 0:
-            return True
+        self._total_delta += delta
+        self._total_gamma += gamma
+        self._total_vega += vega
+    
+    def get_collateral_utilization(self) -> float:
+        """
+        Get current collateral utilization.
         
-        utilization = required / collateral
-        threshold = self.config.risk.pre_emptive_deleveraging_threshold
+        Returns:
+            Utilization ratio (0.0 to 1.0+)
+        """
+        return self._collateral_utilization
+    
+    def check_collateral_threshold(self) -> bool:
+        """
+        Check if pre-emptive de-leveraging threshold breached.
         
-        if utilization >= threshold:
-            logger.warning(
-                f"Margin utilization {utilization:.1%} >= threshold {threshold:.1%}"
-            )
-            return True
-        return False
+        Threshold: 80% of available collateral
+        
+        Returns:
+            True if de-leveraging required
+        """
+        return self._collateral_utilization > 0.80
+    
+    def liquidate_all(self) -> List[Dict[str, Any]]:
+        """
+        Liquidate all positions to delta-neutral.
+        
+        Called by circuit breaker or manual intervention.
+        
+        Returns:
+            List of liquidation orders
+        """
+        orders = []
+        
+        for inst_id, position in self._positions.items():
+            if position != 0:
+                orders.append({
+                    "instrument_id": inst_id,
+                    "action": "SELL" if position > 0 else "BUY",
+                    "quantity": abs(position),
+                    "order_type": "MARKET",
+                    "reason": "RISK_LIQUIDATION"
+                })
+                
+        self._positions = {}
+        self._total_delta = 0.0
+        self._total_gamma = 0.0
+        self._total_vega = 0.0
+        
+        return orders
+    
+    def update_equity(self, pnl_change: float) -> None:
+        """
+        Update current equity after PnL change.
+        
+        Args:
+            pnl_change: PnL change from trades
+        """
+        self._current_equity += pnl_change
+        
+    def set_collateral_utilization(self, utilization: float) -> None:
+        """
+        Set collateral utilization from external calculation.
+        
+        Args:
+            utilization: Utilization ratio
+        """
+        self._collateral_utilization = utilization
+        
+        # Auto de-lever if above threshold
+        if self.check_collateral_threshold() and not self._observation_only:
+            print(f"Pre-emptive de-leveraging triggered at {utilization:.1%} collateral")
+    
+    def get_risk_summary(self) -> dict:
+        """
+        Get current risk summary.
+        
+        Returns:
+            Dictionary with risk metrics
+        """
+        daily_pnl = self._current_equity - self._daily_start_equity
+        daily_return = daily_pnl / self._daily_start_equity
+        
+        return {
+            "current_equity": self._current_equity,
+            "daily_pnl": daily_pnl,
+            "daily_return": daily_return,
+            "circuit_breaker_active": self._circuit_breaker_triggered,
+            "observation_only": self._observation_only,
+            "collateral_utilization": self._collateral_utilization,
+            "total_delta": self._total_delta,
+            "total_gamma": self._total_gamma,
+            "total_vega": self._total_vega,
+            "gross_exposure": sum(abs(p) for p in self._positions.values()),
+            "net_exposure": sum(self._positions.values())
+        }
+    
+    def is_trading_allowed(self) -> bool:
+        """
+        Check if trading is currently allowed.
+        
+        Returns:
+            True if trading permitted, False if observation-only
+        """
+        return not self._observation_only

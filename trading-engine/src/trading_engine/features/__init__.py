@@ -1,5 +1,5 @@
-"""Feature engineering and regime classification."""
+"""Features engineering module."""
 
-from .regime import RegimeClassifier, HMMState
+from .regime import RegimeClassifier
 
-__all__ = ["RegimeClassifier", "HMMState"]
+__all__ = ["RegimeClassifier"]

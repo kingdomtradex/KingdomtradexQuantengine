@@ -1,192 +1,303 @@
 """
-Smart Order Routing and Execution Engine.
+Smart order routing and execution engine.
 
-Features:
-- TWAP slicing with stochastic noise
-- Latency-adaptive execution
-- Venue scoring based on depth, fill rates, fees
-- Slippage control as risk constraint
+Implements latency-adaptive execution with:
+- TWAP scheduling augmented with stochastic noise
+- Real-time venue scoring based on depth, fill rates, and fees
+- Automatic buffer widening during network congestion
+- Slippage control as a first-order risk constraint
 """
 
-import logging
-import random
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, Optional, List
+import numpy as np
 
-logger = logging.getLogger(__name__)
+from ..config import Config
 
 
 class ExecutionEngine:
     """
-    Latency-adaptive smart order router.
+    Smart order routing and execution engine.
     
-    Slices parent orders using TWAP with stochastic timing.
-    Adapts aggressiveness based on network latency conditions.
+    Routes orders to optimal venues while minimizing market impact
+    and adapting to network conditions.
     """
     
-    def __init__(self, config):
+    def __init__(self, config: Config):
         """
         Initialize execution engine.
         
         Args:
-            config: System configuration
+            config: Configuration object with execution parameters
         """
         self.config = config
-        self._latency_history: Dict[str, List[float]] = {}
-        self._active_orders: List[Dict] = []
         
-        logger.info("Execution engine initialized")
-    
-    def generate_orders(self, target_portfolio: Dict[str, float]) -> List[Dict]:
+        # TWAP parameters
+        self.twap_slices = config.execution.twap_slices
+        self.stochastic_noise_std = config.execution.stochastic_noise_std
+        
+        # Latency monitoring
+        self._latency_history: Dict[str, list] = {}
+        self._venue_stats: Dict[str, dict] = {}
+        
+        # Initialize venue statistics
+        self._initialize_venues()
+        
+    def _initialize_venues(self) -> None:
+        """Initialize venue tracking."""
+        # Simulated venues with different characteristics
+        self._venues = [
+            {"id": "VENUE_A", "type": "equity", "latency_ms": 0.5},
+            {"id": "VENUE_B", "type": "crypto", "latency_ms": 2.0},
+            {"id": "VENUE_C", "type": "futures", "latency_ms": 1.0},
+        ]
+        
+        for venue in self._venues:
+            vid = venue["id"]
+            self._venue_stats[vid] = {
+                "depth_score": 0.8,
+                "fill_rate": 0.95,
+                "fee_tier": 0.0002,
+                "recent_latency": []
+            }
+            
+    def route(
+        self,
+        portfolio: Dict[str, float],
+        state: Any
+    ) -> List[Dict[str, Any]]:
         """
-        Generate child orders from target portfolio.
-        
-        Uses TWAP slicing with stochastic noise.
+        Route orders to venues.
         
         Args:
-            target_portfolio: Target positions per symbol
+            portfolio: Target positions
+            state: Current market state
             
         Returns:
             List of order dictionaries
         """
+        if not portfolio:
+            return []
+            
         orders = []
         
-        for symbol, target_qty in target_portfolio.items():
-            if abs(target_qty) < 0.01:
+        for inst_id, target_position in portfolio.items():
+            current_position = state.positions.get(inst_id, 0.0)
+            quantity = target_position - current_position
+            
+            if abs(quantity) < 1e-6:
                 continue
-            
-            # Slice into TWAP chunks
-            n_slices = self.config.execution.twap_slices
-            
-            for i in range(n_slices):
-                # Base slice size
-                base_size = target_qty / n_slices
                 
-                # Add stochastic noise (±20%)
-                noise = random.uniform(-0.2, 0.2)
-                slice_size = base_size * (1 + noise)
-                
-                # Stochastic timing jitter
-                base_interval = 60  # seconds
-                jitter = random.uniform(-10, 10)
-                execute_at = i * base_interval + jitter
+            # Slice order using TWAP with stochastic noise
+            slices = self._create_twap_slices(inst_id, quantity)
+            
+            # Route each slice to optimal venue
+            for slice_qty in slices:
+                best_venue = self._select_best_venue(inst_id, abs(slice_qty))
                 
                 order = {
-                    'symbol': symbol,
-                    'side': 'BUY' if slice_size > 0 else 'SELL',
-                    'quantity': abs(slice_size),
-                    'type': 'LIMIT',
-                    'execute_at': execute_at,
-                    'venue': self._select_venue(symbol),
+                    "instrument_id": inst_id,
+                    "action": "BUY" if slice_qty > 0 else "SELL",
+                    "quantity": abs(slice_qty),
+                    "order_type": "LIMIT",
+                    "venue": best_venue,
+                    "slice_id": len(orders),
+                    "total_slices": len(slices)
                 }
                 orders.append(order)
-        
-        self._active_orders = orders
+                
         return orders
     
-    def execute(self, orders: List[Dict]) -> Dict[str, Any]:
+    def _create_twap_slices(
+        self,
+        instrument_id: str,
+        total_quantity: float
+    ) -> List[float]:
         """
-        Execute orders with latency-adaptive logic.
+        Create TWAP slices with stochastic noise.
         
         Args:
-            orders: List of order dictionaries
+            instrument_id: Instrument identifier
+            total_quantity: Total quantity to execute
             
         Returns:
-            Execution results with fills and realized P&L
+            List of slice quantities
         """
-        fills = []
-        realized_pnl = 0.0
+        n_slices = self.twap_slices
+        base_slice = total_quantity / n_slices
         
-        for order in orders:
-            # Check latency conditions
-            venue = order['venue']
-            latency = self._measure_latency(venue)
+        slices = []
+        remaining = total_quantity
+        
+        for i in range(n_slices - 1):
+            # Add stochastic noise to slice size and timing
+            noise = np.random.normal(0, self.stochastic_noise_std)
+            slice_qty = base_slice * (1 + noise)
             
-            # Adapt aggressiveness based on latency
-            if self._is_latency_elevated(venue):
-                # Widen limit buffers, reduce aggressiveness
-                order['price_buffer_bps'] = 5  # Wider buffer
-                logger.debug(f"Elevated latency at {venue} - widening buffers")
-            else:
-                order['price_buffer_bps'] = 1  # Tight buffer
+            # Ensure we don't exceed remaining
+            slice_qty = np.sign(slice_qty) * min(abs(slice_qty), abs(remaining))
             
-            # Simulate fill (in production: send to venue)
-            fill = self._simulate_fill(order)
-            if fill:
-                fills.append(fill)
-                realized_pnl += fill.get('pnl', 0.0)
+            slices.append(slice_qty)
+            remaining -= slice_qty
+            
+        # Last slice takes remaining
+        slices.append(remaining)
         
-        return {
-            'fills': fills,
-            'realized_pnl': realized_pnl,
-            'fill_rate': len(fills) / max(len(orders), 1),
-        }
+        return slices
     
-    def _select_venue(self, symbol: str) -> str:
-        """Select optimal venue based on real-time scoring."""
-        # Simplified venue selection
-        # In production: scores venues on depth, fill rates, fee tiers
-        venues = ['VENUE_A', 'VENUE_B', 'VENUE_C']
+    def _select_best_venue(
+        self,
+        instrument_id: str,
+        quantity: float
+    ) -> str:
+        """
+        Select best venue for order.
         
-        # Weighted random selection (production uses real scores)
-        return random.choice(venues)
+        Scores venues based on:
+        - Top-of-book depth
+        - Recent fill rates
+        - Fee tiers
+        
+        Args:
+            instrument_id: Instrument identifier
+            quantity: Order quantity
+            
+        Returns:
+            Best venue ID
+        """
+        weights = self.config.execution.venue_score_weights
+        
+        best_score = -np.inf
+        best_venue = self._venues[0]["id"]
+        
+        for venue in self._venues:
+            vid = venue["id"]
+            stats = self._venue_stats[vid]
+            
+            # Calculate venue score
+            depth_score = stats["depth_score"]
+            fill_score = stats["fill_rate"]
+            fee_score = 1.0 - stats["fee_tier"] * 1000  # Normalize fees
+            
+            score = (
+                weights["depth"] * depth_score +
+                weights["fill_rate"] * fill_score +
+                weights["fees"] * fee_score
+            )
+            
+            # Adjust for latency if above threshold
+            if self._is_latency_elevated(vid):
+                score *= 0.8  # Penalty for elevated latency
+                
+            if score > best_score:
+                best_score = score
+                best_venue = vid
+                
+        return best_venue
     
-    def _measure_latency(self, venue: str) -> float:
-        """Measure round-trip latency to venue."""
-        # Simulated latency measurement
-        # In production: continuous RTT monitoring
-        if venue not in self._latency_history:
-            self._latency_history[venue] = []
+    def _is_latency_elevated(self, venue_id: str) -> bool:
+        """
+        Check if venue latency is elevated.
         
-        # Simulate RTT (microseconds)
-        rtt = random.gauss(100, 20)  # 100us median, 20us std
-        self._latency_history[venue].append(rtt)
-        
-        # Keep rolling window
-        if len(self._latency_history[venue]) > 100:
-            self._latency_history[venue].pop(0)
-        
-        return rtt
-    
-    def _is_latency_elevated(self, venue: str) -> bool:
-        """Check if latency exceeds 2 standard deviations."""
-        if venue not in self._latency_history or len(self._latency_history[venue]) < 10:
+        Args:
+            venue_id: Venue identifier
+            
+        Returns:
+            True if latency exceeds 2 std from median
+        """
+        if venue_id not in self._venue_stats:
             return False
+            
+        latencies = self._venue_stats[venue_id]["recent_latency"]
         
-        history = self._latency_history[venue]
-        median = sorted(history)[len(history) // 2]
-        std = (sum((x - median)**2 for x in history) / len(history)) ** 0.5
+        if len(latencies) < 10:
+            return False
+            
+        median_lat = np.median(latencies)
+        std_lat = np.std(latencies)
         
-        threshold = median + 2 * std
-        current = history[-1]
+        threshold = median_lat + self.config.execution.latency_jitter_threshold_std * std_lat
         
-        return current > threshold
+        return latencies[-1] > threshold if latencies else False
     
-    def _simulate_fill(self, order: Dict) -> Optional[Dict]:
-        """Simulate order fill (placeholder for real execution)."""
-        # Simplified fill simulation
-        fill_rate = 0.95  # 95% fill rate
+    def update_venue_stats(
+        self,
+        venue_id: str,
+        depth: float,
+        fill_rate: float,
+        latency_ms: float
+    ) -> None:
+        """
+        Update venue statistics.
         
-        if random.random() > fill_rate:
-            return None
+        Args:
+            venue_id: Venue identifier
+            depth: Current depth score
+            fill_rate: Recent fill rate
+            latency_ms: Measured latency in milliseconds
+        """
+        if venue_id not in self._venue_stats:
+            return
+            
+        stats = self._venue_stats[venue_id]
+        stats["depth_score"] = depth
+        stats["fill_rate"] = fill_rate
         
-        # Simulate slippage
-        slippage_bps = random.gauss(1, 0.5)  # 1 bp average slippage
+        # Track latency history
+        stats["recent_latency"].append(latency_ms)
+        if len(stats["recent_latency"]) > 100:
+            stats["recent_latency"].pop(0)
+            
+    def get_execution_quality_report(self) -> dict:
+        """
+        Generate execution quality report.
         
-        return {
-            'symbol': order['symbol'],
-            'side': order['side'],
-            'quantity': order['quantity'],
-            'slippage_bps': slippage_bps,
-            'pnl': -order['quantity'] * slippage_bps / 10000,  # Slippage cost
+        Returns:
+            Dictionary with execution metrics
+        """
+        report = {
+            "venues": {},
+            "average_latency_ms": 0.0,
+            "elevated_latency_venues": []
         }
+        
+        all_latencies = []
+        
+        for vid, stats in self._venue_stats.items():
+            latencies = stats["recent_latency"]
+            avg_lat = np.mean(latencies) if latencies else 0.0
+            all_latencies.extend(latencies)
+            
+            is_elevated = self._is_latency_elevated(vid)
+            if is_elevated:
+                report["elevated_latency_venues"].append(vid)
+                
+            report["venues"][vid] = {
+                "avg_latency_ms": avg_lat,
+                "fill_rate": stats["fill_rate"],
+                "depth_score": stats["depth_score"],
+                "fee_tier": stats["fee_tier"]
+            }
+            
+        if all_latencies:
+            report["average_latency_ms"] = np.mean(all_latencies)
+            
+        return report
     
-    def liquidate_all(self) -> None:
-        """Immediately liquidate all positions to delta-neutral."""
-        logger.warning("LIQUIDATING ALL POSITIONS")
-        # In production: send aggressive market orders to close
-        self._active_orders = []
-    
-    def close(self) -> None:
-        """Gracefully close execution engine."""
-        logger.info("Closing execution engine...")
-        self._active_orders = []
+    def widen_buffers(self, venue_id: str) -> float:
+        """
+        Widen limit order buffers during network congestion.
+        
+        Args:
+            venue_id: Venue identifier
+            
+        Returns:
+            Buffer width in basis points
+        """
+        # Base buffer
+        buffer_bp = 5.0
+        
+        # Increase if latency elevated
+        if self._is_latency_elevated(venue_id):
+            buffer_bp *= 2.0
+            
+        return buffer_bp

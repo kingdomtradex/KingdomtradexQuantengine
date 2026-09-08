@@ -1,29 +1,38 @@
 # Trading Engine Configuration
-# Version: 2.2 (Final Technical Draft)
-
-leverage:
-  max_gross: 10.0           # Maximum gross leverage ceiling
-  base: 1.0                 # Baseline leverage
-  variance_premium_sensitivity: 0.5  # Alpha parameter for VRP scaling
+# Version 2.2 - Pre-commitment Locked Parameters
 
 risk:
-  daily_drawdown_limit: -0.025   # -2.5% circuit breaker
-  risk_per_trade: 0.0075         # 0.75% max risk per trade
-  kelly_multiplier: 0.40         # Fractional Kelly lambda
-  pre_emptive_deleveraging_threshold: 0.80  # 80% margin utilization trigger
+  max_daily_drawdown: -0.025    # Circuit breaker trigger (-2.5%)
+  max_gross_leverage: 10.0      # Ceiling for dynamic leverage
+  kelly_multiplier: 0.40        # Fractional Kelly lambda (pre-commitment locked)
+  risk_per_trade: 0.0075        # 0.75% hard limit per trade
 
-regime:
-  hmm_states: 3                  # Number of latent states
-  reestimate_frequency: "daily"  # HMM re-estimation frequency
+leverage:
+  base_leverage: 1.0            # Baseline leverage
+  vrp_sensitivity: 0.5          # Sensitivity to variance risk premium
+  max_leverage: 10.0            # Maximum gross leverage ceiling
+
+hmm:
+  n_states: 3                   # Low-Vol, High-Vol, Fractured
+  regime_thresholds:
+    fractured_exposure_cap: 0.2   # 20% exposure in fractured regime
+    high_vol_exposure_cap: 0.5    # 50% exposure in high-vol regime
+    low_vol_exposure_cap: 1.0     # Full exposure in low-vol regime
 
 execution:
   twap_slices: 10               # Number of TWAP slices per parent order
-  latency_jitter_threshold: 2.0  # Standard deviations for latency adaptation
-  fee_crypto_bps: 2.0           # Crypto maker-taker fees (bps)
-  fee_equity_bps: 0.5           # Equity execution costs (bps)
-  fee_futures_bps: 0.3          # Futures friction costs (bps)
+  stochastic_noise_std: 0.1     # Standard deviation for slice noise
+  latency_jitter_threshold_std: 2.0  # Std devs above median for congestion detection
+  venue_score_weights:
+    depth: 0.4                  # Weight for book depth
+    fill_rate: 0.4              # Weight for fill rate
+    fees: 0.2                   # Weight for fee tier
 
-# System parameters
-instrument_universe_size: 350
-capacity_aum: 15000000          # $15M market-impact capacity
-update_frequency_ms: 1
+training:
+  validation_loss_tolerance: 0.02   # 2% tolerance for model updates
+  drawdown_penalty_weight: 3.0      # Drawdown penalized 3x vs gain in GA
+  update_frequency: daily           # Model update frequency
+
+# Capital settings
+initial_capital: 1000000.0    # $1M initial capital
+instrument_universe_size: 350 # Number of instruments
