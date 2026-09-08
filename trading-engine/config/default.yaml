@@ -1,0 +1,29 @@
+# Trading Engine Configuration
+# Version: 2.2 (Final Technical Draft)
+
+leverage:
+  max_gross: 10.0           # Maximum gross leverage ceiling
+  base: 1.0                 # Baseline leverage
+  variance_premium_sensitivity: 0.5  # Alpha parameter for VRP scaling
+
+risk:
+  daily_drawdown_limit: -0.025   # -2.5% circuit breaker
+  risk_per_trade: 0.0075         # 0.75% max risk per trade
+  kelly_multiplier: 0.40         # Fractional Kelly lambda
+  pre_emptive_deleveraging_threshold: 0.80  # 80% margin utilization trigger
+
+regime:
+  hmm_states: 3                  # Number of latent states
+  reestimate_frequency: "daily"  # HMM re-estimation frequency
+
+execution:
+  twap_slices: 10               # Number of TWAP slices per parent order
+  latency_jitter_threshold: 2.0  # Standard deviations for latency adaptation
+  fee_crypto_bps: 2.0           # Crypto maker-taker fees (bps)
+  fee_equity_bps: 0.5           # Equity execution costs (bps)
+  fee_futures_bps: 0.3          # Futures friction costs (bps)
+
+# System parameters
+instrument_universe_size: 350
+capacity_aum: 15000000          # $15M market-impact capacity
+update_frequency_ms: 1
